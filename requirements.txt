@@ -1,0 +1,37 @@
+# =============================================================================
+# requirements.txt
+# Swin-DeepSCN-AgriVision: Plant Disease Classification Pipeline
+# Environment: WSL 2 / Linux (Python 3.9+)
+# =============================================================================
+
+# --- Core Deep Learning ---
+torch>=2.1.0
+torchvision>=0.16.0
+torchaudio>=2.1.0
+
+# --- Transformer & Pre-trained Model Hub ---
+timm>=0.9.12            # Swin Transformer model zoo
+
+# --- Scientific Computing (used by DeepSCN) ---
+numpy>=1.24.0
+scipy>=1.11.0           # Optional: for advanced linalg, pinv fallback
+
+# --- Machine Learning Utilities ---
+scikit-learn>=1.3.0     # Metrics: accuracy, precision, recall, f1, confusion matrix
+
+# --- Data Handling ---
+Pillow>=10.0.0          # Image I/O
+pandas>=2.0.0           # (Optional) for results tables
+
+# --- Visualization ---
+matplotlib>=3.7.0       # Confusion matrix, training curves, attention maps
+seaborn>=0.12.0         # Styled confusion matrix heatmaps
+
+# --- Explainable AI (XAI) ---
+grad-cam>=1.4.8         # pytorch-grad-cam: Grad-CAM for vision models
+
+# --- Progress & Logging ---
+tqdm>=4.65.0            # Progress bars for feature extraction loops
+
+# --- Utilities ---
+joblib>=1.3.0           # Efficient numpy array caching (save/load embeddings)

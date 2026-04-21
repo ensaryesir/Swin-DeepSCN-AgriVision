@@ -1,3 +1,17 @@
+# =============================================================================
+# Swin-DeepSCN-AgriVision — Project-specific ignores
+# =============================================================================
+
+# Dataset — too large (690 MB) to commit to Git
+data/PlantVillage
+
+# Swin embedding cache (.npy files, can be hundreds of MB)
+cache/
+
+# Generated output figures
+outputs/
+
+# =============================================================================
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
