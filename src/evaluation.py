@@ -219,30 +219,34 @@ def plot_comparison(
     ax.bar_label(bars2, fmt="%.3f", padding=2, fontsize=8)
     ax.grid(axis="y", alpha=0.3)
 
-    # ---- Right: training time comparison (log scale) ----
+    # ---- Right: training time comparison (linear scale) ----
     ax2 = axes[1]
     models       = ["DeepSCN", "MLP (Baseline)"]
     times        = [deepscn_metrics["train_time"], mlp_metrics["train_time"]]
     colors       = ["#3A86FF", "#FF6B6B"]
     bars3 = ax2.bar(models, times, color=colors, alpha=0.85, edgecolor="white",
                     width=0.4)
-    ax2.set_yscale("log")   # log scale makes the speedup visually obvious
-    ax2.set_ylabel("Training Time (seconds) — log scale", fontsize=11)
+    ax2.set_ylabel("Training Time (seconds)", fontsize=11)
     ax2.set_title("Training Time Comparison", fontsize=12)
     ax2.bar_label(bars3, fmt="%.2f s", padding=3, fontsize=10)
     ax2.grid(axis="y", alpha=0.3)
 
     # Annotate speedup factor
     speedup = mlp_metrics["train_time"] / max(deepscn_metrics["train_time"], 1e-9)
+    # Place the text slightly above the highest bar
+    max_time = max(times)
+    ax2.set_ylim(0, max_time * 1.25)
+    
+    # We write it above the DeepSCN bar (index 0)
     ax2.text(
-        0, deepscn_metrics["train_time"] * 1.5,
+        0, deepscn_metrics["train_time"] + (max_time * 0.05),
         f"~{speedup:.1f}× faster",
         ha="center", va="bottom", fontsize=11,
         color="#3A86FF", fontweight="bold"
     )
 
     plt.suptitle("Swin-DeepSCN vs. MLP Baseline — Plant Disease Classification",
-                 fontsize=13, y=1.01)
+                 fontsize=13)
     plt.tight_layout()
 
     if save_path:

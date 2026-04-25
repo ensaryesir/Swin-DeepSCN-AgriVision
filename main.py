@@ -278,16 +278,21 @@ def main() -> None:
                                                  config.SELECTED_CLASSES)
 
         if xai_image_path and os.path.isfile(xai_image_path):
+            print(f"[XAI] Input image: {xai_image_path}")
             try:
                 from src.xai_gradcam import generate_gradcam
+                # Pass trained MLP head weights so Grad-CAM uses
+                # a model that actually learned PlantVillage classes
+                trained_state = mlp_trainer.model.state_dict()
                 generate_gradcam(
-                    image_path  = xai_image_path,
-                    class_names = class_names,
-                    save_path   = config.GRADCAM_OUTPUT,
+                    image_path         = xai_image_path,
+                    class_names        = class_names,
+                    save_path          = config.GRADCAM_OUTPUT,
+                    trained_head_state = trained_state,
                 )
             except Exception as exc:
                 print(f"[XAI] Grad-CAM skipped due to error: {exc}")
-                print("       Install 'grad-cam' package: pip install grad-cam")
+                import traceback; traceback.print_exc()
         else:
             print("[XAI] No valid image path provided. "
                   "Use --xai <path> or check DATASET_ROOT.")

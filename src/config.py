@@ -82,9 +82,9 @@ FEATURE_BATCH_SIZE = 32     # batch size during feature extraction (no grad)
 # ---------------------------------------------------------------------------
 
 # Maximum number of hidden nodes the incremental SCN builder can reach.
-DEEPSCN_MAX_NODES  = 1024
+DEEPSCN_MAX_NODES  = 512
 # Number of new candidate nodes sampled at each construction step.
-DEEPSCN_CANDIDATES = 100
+DEEPSCN_CANDIDATES = 10
 # Tolerance threshold T in the SCN inequality constraint:
 #   The new node is accepted only if it reduces the residual error.
 DEEPSCN_TOLERANCE  = 1e-6

@@ -45,6 +45,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn as nn
 import timm
 from PIL import Image
 from torchvision import transforms
@@ -93,17 +94,23 @@ def generate_gradcam(
     model_name: str = config.SWIN_MODEL_NAME,
     save_path: str = config.GRADCAM_OUTPUT,
     class_names: Optional[list] = None,
+    trained_head_state: Optional[dict] = None,
 ) -> np.ndarray:
     """
     Generate Grad-CAM++ attention map for a single leaf image.
 
     Parameters
     ----------
-    image_path   : absolute path to the input image file
-    target_class : class index to explain (None → uses predicted class)
-    model_name   : timm model name (should match the extractor model)
-    save_path    : where to save the overlay image
-    class_names  : optional list of class names for the figure title
+    image_path         : absolute path to the input image file
+    target_class       : class index to explain (None → uses predicted class)
+    model_name         : timm model name (should match the extractor model)
+    save_path          : where to save the overlay image
+    class_names        : optional list of class names for the figure title
+    trained_head_state : optional state_dict from a trained classification head.
+                         If provided, replaces the random head with trained weights
+                         so that Grad-CAM explains a model that actually learned the
+                         PlantVillage classes. Without this, the head is randomly
+                         initialised and predictions are meaningless.
 
     Returns
     -------
@@ -112,26 +119,56 @@ def generate_gradcam(
     device = config.DEVICE
 
     # ---- Step 1: Load model WITH its classification head ----
-    # We need a model that outputs class logits for Grad-CAM to differentiate.
-    # We re-load the backbone here with num_classes matching SELECTED_CLASSES.
     n_classes = len(config.SELECTED_CLASSES)
     print(f"[XAI] Loading model '{model_name}' for Grad-CAM ...")
     model = timm.create_model(
         model_name,
         pretrained=True,
-        num_classes=n_classes,  # keep the head
+        num_classes=n_classes,
     ).to(device)
+
+    # ---- Step 1b: Replace the random head with trained weights ----
+    # The critical fix: without trained weights the classification head
+    # is randomly initialised, producing meaningless predictions.
+    if trained_head_state is not None:
+        # Build a small MLP head matching baseline_mlp architecture
+        from src.baseline_mlp import MLP
+        embed_dim = model.head.fc.in_features
+        trained_mlp = MLP(
+            input_dim=embed_dim,
+            n_classes=n_classes,
+        )
+        trained_mlp.load_state_dict(trained_head_state)
+        trained_mlp.to(device)
+        trained_mlp.eval()
+
+        # Wrapper that applies L2 normalization before the MLP.
+        # This is CRITICAL: during feature extraction (feature_extractor.py),
+        # embeddings are L2-normalised before being fed to the MLP.
+        # Without this, the MLP receives unnormalised activations and
+        # produces meaningless predictions.
+        class _L2NormAndMLP(nn.Module):
+            def __init__(self, mlp_sequential):
+                super().__init__()
+                self.net = mlp_sequential
+            def forward(self, x):
+                x = torch.nn.functional.normalize(x, p=2, dim=-1)
+                return self.net(x)
+
+        # Replace ONLY the final FC layer inside ClassifierHead.
+        # This preserves global_pool + flatten so the tensor arriving
+        # at our wrapper is correctly shaped as (B, 1024) — not 4D.
+        model.head.fc = _L2NormAndMLP(trained_mlp.net)
+        print("[XAI] Loaded TRAINED classification head (MLP weights + L2 norm)")
+    else:
+        print("[XAI] WARNING: Using untrained random head — predictions may be inaccurate!")
+
     model.eval()
 
     # ---- Step 2: Identify the target layer ----
-    # For Swin Transformer, we hook into the *last* block of the last stage.
-    # In timm's Swin implementation this is:
-    #     model.layers[-1].blocks[-1].norm1   (LayerNorm before final block)
-    # The outputs of this layer contain the richest semantic representation.
     try:
         target_layer = [model.layers[-1].blocks[-1].norm1]
     except AttributeError:
-        # Fallback for older timm API
         target_layer = [model.norm]
 
     # ---- Step 3: Prepare the image ----
@@ -144,11 +181,9 @@ def generate_gradcam(
     pil_image  = Image.open(image_path).convert("RGB")
     pil_resized = pil_image.resize((config.IMAGE_SIZE, config.IMAGE_SIZE))
 
-    # Normalised float image for overlay (values in [0, 1])
     img_float = np.array(pil_resized, dtype=np.float32) / 255.0
 
-    # Model input tensor
-    input_tensor = transform(pil_image).unsqueeze(0).to(device)  # (1, 3, H, W)
+    input_tensor = transform(pil_image).unsqueeze(0).to(device)
 
     # ---- Step 4: Run model to get predicted class ----
     with torch.no_grad():
