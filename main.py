@@ -111,6 +111,11 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
+    # ---- Reproducibility: seed ALL random number generators ----
+    # This must happen BEFORE any model creation, data loading, or
+    # training to guarantee identical results across runs.
+    config.set_seed(config.RANDOM_SEED)
+
     print("\n" + "=" * 66)
     print("  Swin-DeepSCN-AgriVision — Plant Disease Classification")
     print("=" * 66)

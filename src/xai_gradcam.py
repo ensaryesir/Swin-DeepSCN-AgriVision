@@ -35,6 +35,32 @@ targets the last layer-norm + attention output as the "convolutional" layer.
 We use the `GradCAMPlusPlus` variant (Chattopadhay et al., 2018) which
 produces smoother and more localised maps than vanilla Grad-CAM by using
 2nd-order gradient information.
+
+Bug-Fix Log (v2)
+-----------------
+1. TARGET LAYER: Changed from `norm1` (pre-attention) to `model.norm`
+   (final LayerNorm after all stages). `norm1` captures features BEFORE
+   the shifted-window attention — its activations do not reflect the
+   attention-modulated spatial patterns, causing edge/corner artefacts
+   from the window-partition padding. `model.norm` outputs post-attention,
+   post-MLP features that encode where the model actually "looked".
+
+2. GRADIENT FLOW: The backbone must have `requires_grad = True` during
+   Grad-CAM so that gradients flow from the class score back through the
+   target layer. Previously, while parameters were not explicitly frozen,
+   no explicit enablement was done either. Now we explicitly enable grads
+   on ALL parameters for the Grad-CAM pass (weights are never *updated*
+   since no optimizer step is called).
+
+3. RESHAPE TRANSFORM: Made auto-detecting — reads actual spatial dims
+   from the tensor instead of relying on hardcoded height=7, width=7.
+   This makes the code robust to different Swin variants (tiny/small/base).
+
+4. UPSAMPLING: Applied Gaussian smoothing (σ=1.0) after bilinear
+   upsampling to soften the blocky 7×7 → 224×224 interpolation artefacts
+   that cause sharp grid-like edges in the heatmap.
+
+5. IMAGE PREPROCESSING & L2 NORM: Verified correct; no changes needed.
 """
 
 import os
@@ -62,26 +88,132 @@ from src import config
 # Helper: reshape transform for timm Swin models
 # ---------------------------------------------------------------------------
 
-def _swin_reshape_transform(tensor: torch.Tensor, height: int = 7,
+def _swin_reshape_transform(tensor: torch.Tensor,
+                             height: int = 7,
                              width: int = 7) -> torch.Tensor:
     """
     Reshape feature blocks to spatial (B, C, H, W) layout for Grad-CAM.
-    
-    Timm recent versions return a 4D tensor (B, H, W, C) directly for Swin stages.
-    Older versions returned a flat sequence (B, H*W, C).
+
+    Timm Swin layers output tensors in two possible formats depending
+    on the layer and timm version:
+      - 4D: (B, H, W, C) — from norm1, model.norm, block output
+      - 3D: (B, H*W, C)  — from norm2 (after window-reverse + reshape)
+
+    FIX: Auto-detect spatial dimensions instead of relying on hardcoded
+    height/width.  For 3D tensors, we compute H = W = √(seq_len) which
+    is always valid for Swin (square spatial grids at each stage).
     """
     if tensor.dim() == 4:
-        # If already (B, H, W, C), just permute channels to PyTorch format (B, C, H, W)
+        # Already (B, H, W, C) — just permute to PyTorch (B, C, H, W)
         return tensor.permute(0, 3, 1, 2)
-    else:
-        # Fallback for old (B, Sequence, C) format
-        result = tensor.reshape(
-            tensor.size(0),   # batch
-            height,           # spatial H
-            width,            # spatial W
-            tensor.size(2),   # channels / embed_dim
-        )
+    elif tensor.dim() == 3:
+        # (B, seq_len, C) — infer spatial dimensions
+        B, seq_len, C = tensor.shape
+        h = w = int(seq_len ** 0.5)
+        if h * w != seq_len:
+            # Non-square fallback: use provided height/width hints
+            h, w = height, width
+        result = tensor.reshape(B, h, w, C)
         return result.permute(0, 3, 1, 2)
+    else:
+        raise ValueError(
+            f"[XAI] Unexpected tensor dim={tensor.dim()}, shape={tensor.shape}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Helper: Gaussian smoothing for heatmap post-processing
+# ---------------------------------------------------------------------------
+
+def _smooth_cam(cam: np.ndarray, sigma: float = 1.0) -> np.ndarray:
+    """
+    Apply Gaussian smoothing to the upsampled CAM heatmap to reduce
+    the blocky 7×7 → 224×224 interpolation artefacts.
+
+    Uses scipy if available, otherwise falls back to a simple box blur.
+    """
+    try:
+        from scipy.ndimage import gaussian_filter
+        smoothed = gaussian_filter(cam, sigma=sigma)
+    except ImportError:
+        # Simple 3×3 box blur as fallback
+        from numpy.lib.stride_tricks import sliding_window_view
+        pad = 1
+        padded = np.pad(cam, pad, mode="reflect")
+        windows = sliding_window_view(padded, (3, 3))
+        smoothed = windows.mean(axis=(-2, -1))
+
+    # Re-normalise to [0, 1]
+    vmin, vmax = smoothed.min(), smoothed.max()
+    if vmax - vmin > 1e-8:
+        smoothed = (smoothed - vmin) / (vmax - vmin)
+    return smoothed.astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Helper: find the best target layer for Grad-CAM
+# ---------------------------------------------------------------------------
+
+def _find_target_layer(model: nn.Module) -> list:
+    """
+    Select the optimal target layer for Grad-CAM on a timm Swin model.
+
+    Priority order (best → fallback):
+      1. model.norm       — Final LayerNorm applied to the 7×7 spatial
+                            feature map AFTER all 4 stages.  This captures
+                            post-attention, post-MLP features: the most
+                            refined spatial representation before global
+                            average pooling.  Output: (B, 7, 7, 1024).
+
+      2. model.layers[-1].blocks[-1].norm2
+                          — Post-attention LayerNorm inside the last block.
+                            Output: (B, 49, 1024) — 3D but reshape-able.
+
+      3. model.layers[-1].blocks[-1].norm1
+                          — Pre-attention LayerNorm.  WORST choice because
+                            activations do NOT contain attention information.
+                            The shifted-window partition/reverse can inject
+                            edge/corner artefacts into these features.
+
+    Why `model.norm` is the best choice:
+      The Swin forward pass is:
+        x = patch_embed(img)
+        for stage in self.layers:
+            x = stage(x)            # each stage: blocks + patch_merge
+        x = self.norm(x)            # ← TARGET: final spatial features
+        x = self.head(x)            # global_pool → fc → class scores
+
+      At `model.norm`, the tensor is still spatial (B, 7, 7, 1024) and
+      contains ALL attention-modulated information from all 4 stages.
+      Gradients from the class score flow back through the short path
+      head → norm, giving strong, clean spatial signals.
+    """
+    # Priority 1: model.norm (final LayerNorm — best for Swin)
+    if hasattr(model, "norm") and isinstance(model.norm, nn.LayerNorm):
+        layer = model.norm
+        print(f"[XAI] Target layer: model.norm (final LayerNorm, post-attention)")
+        return [layer]
+
+    # Priority 2: norm2 in last block (post-attention, pre-MLP)
+    try:
+        layer = model.layers[-1].blocks[-1].norm2
+        print(f"[XAI] Target layer: layers[-1].blocks[-1].norm2 (post-attention)")
+        return [layer]
+    except (AttributeError, IndexError):
+        pass
+
+    # Priority 3: norm1 in last block (pre-attention — least ideal)
+    try:
+        layer = model.layers[-1].blocks[-1].norm1
+        print(f"[XAI] Target layer: layers[-1].blocks[-1].norm1 (pre-attention, fallback)")
+        return [layer]
+    except (AttributeError, IndexError):
+        pass
+
+    raise RuntimeError(
+        "[XAI] Could not find a suitable target layer in the model. "
+        "Please verify the timm model architecture."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +249,11 @@ def generate_gradcam(
     cam_image : (H, W, 3) uint8 numpy array — overlay of heatmap + image
     """
     device = config.DEVICE
+
+    # ---- Step 0: Seed for deterministic Grad-CAM output ----
+    # When called standalone (not via main.py), seeds may not be set yet.
+    # Re-seeding is idempotent and guarantees the same heatmap every run.
+    config.set_seed(config.RANDOM_SEED)
 
     # ---- Step 1: Load model WITH its classification head ----
     n_classes = len(config.SELECTED_CLASSES)
@@ -163,15 +300,26 @@ def generate_gradcam(
     else:
         print("[XAI] WARNING: Using untrained random head — predictions may be inaccurate!")
 
+    # ---- Step 1c: FIX #4 — Ensure gradient flow through backbone ----
+    # Grad-CAM needs gradients to flow from the class score back through
+    # the target layer.  We explicitly enable requires_grad on ALL
+    # parameters.  This does NOT mean we update them (no optimizer.step)
+    # — it only allows ∂score/∂activation to be computed.
+    for param in model.parameters():
+        param.requires_grad = True
+
     model.eval()
 
-    # ---- Step 2: Identify the target layer ----
-    try:
-        target_layer = [model.layers[-1].blocks[-1].norm1]
-    except AttributeError:
-        target_layer = [model.norm]
+    # ---- Step 2: FIX #1 — Select the best target layer ----
+    # OLD (BUGGY):  target_layer = [model.layers[-1].blocks[-1].norm1]
+    #   norm1 captures features BEFORE attention → edge/corner artefacts.
+    # NEW:  model.norm = final LayerNorm AFTER all stages, post-attention.
+    target_layer = _find_target_layer(model)
 
     # ---- Step 3: Prepare the image ----
+    # FIX #3: Exactly matches the test-time transform in data_loader.py.
+    # The transform chain is: Resize → ToTensor → Normalize(ImageNet stats)
+    # No augmentation (flip/jitter/rotation) — identical to test pipeline.
     transform = transforms.Compose([
         transforms.Resize((config.IMAGE_SIZE, config.IMAGE_SIZE)),
         transforms.ToTensor(),
@@ -194,7 +342,10 @@ def generate_gradcam(
     class_label = (
         class_names[class_idx] if class_names else f"Class {class_idx}"
     )
-    print(f"[XAI] Predicted class: {pred_class} ({class_label})")
+    pred_label = (
+        class_names[pred_class] if class_names else f"Class {pred_class}"
+    )
+    print(f"[XAI] Predicted class: {pred_class} ({pred_label})")
     print(f"[XAI] Explaining class: {class_idx} ({class_label})")
 
     # ---- Step 5: Generate Grad-CAM++ heatmap ----
@@ -208,6 +359,13 @@ def generate_gradcam(
     # grayscale_cam shape: (1, H, W) — values ∈ [0, 1]
     grayscale_cam = cam(input_tensor=input_tensor, targets=targets)
     grayscale_cam = grayscale_cam[0]   # (H, W)
+
+    # ---- Step 5b: FIX #5 — Smooth the upsampled heatmap ----
+    # The raw CAM is upsampled from 7×7 → 224×224 via bilinear interpolation
+    # inside pytorch-grad-cam.  This produces blocky artefacts at grid cell
+    # boundaries.  A light Gaussian blur removes them without destroying
+    # the spatial signal.
+    grayscale_cam = _smooth_cam(grayscale_cam, sigma=1.5)
 
     # ---- Step 6: Overlay heatmap on original image ----
     cam_image = show_cam_on_image(

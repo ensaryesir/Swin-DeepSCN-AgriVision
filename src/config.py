@@ -8,6 +8,7 @@ module can import from a single source of truth without hard-coding values.
 """
 
 import os
+import random
 
 # ---------------------------------------------------------------------------
 # 1.  DATASET CONFIGURATION
@@ -24,8 +25,8 @@ import os
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATASET_ROOT = os.path.join(BASE_DIR, "data", "PlantVillage")
 
-# Subset of class folder-names to use.  Keeping 4 classes keeps GPU/RAM
-# requirements manageable on a WSL 2 machine with modest resources.
+# Subset of class folder-names to use.  Keeping 15 classes (3 Pepper +
+# 3 Potato + 9 Tomato) balances coverage with GPU/RAM constraints.
 SELECTED_CLASSES = [
     "Pepper__bell___Bacterial_spot",
     "Pepper__bell___healthy",
@@ -72,8 +73,6 @@ SWIN_EMBED_DIM    = None    # None → auto-detected in feature_extractor.py
 
 FEATURE_BATCH_SIZE = 32     # batch size during feature extraction (no grad)
 
-# Directory where extracted .npy embedding arrays will be cached to disk
-# so re-runs skip the expensive forward pass.
 # Directory where extracted .npy embedding arrays will be cached to disk
 # so re-runs skip the expensive forward pass.
 
@@ -128,4 +127,37 @@ GRADCAM_OUTPUT            = os.path.join(OUTPUT_DIR, "gradcam_attention.png")
 # 'cuda' | 'cpu'.  Feature extraction benefits greatly from a GPU.
 # DeepSCN itself runs in NumPy on CPU (matrix inversion is not GPU-bound).
 import torch
+import numpy as np
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+# ---------------------------------------------------------------------------
+# 8.  REPRODUCIBILITY
+# ---------------------------------------------------------------------------
+
+def set_seed(seed: int = RANDOM_SEED) -> None:
+    """
+    Set all random seeds for full deterministic reproducibility.
+
+    This must be called ONCE at the start of main() before any model
+    creation, data loading, or training begins.  It controls:
+      - Python's built-in `random` (used by some data augmentations)
+      - NumPy's global RNG (used by DeepSCN candidate sampling)
+      - PyTorch's CPU RNG (used by MLP weight initialisation)
+      - PyTorch's CUDA RNG (used by GPU operations)
+      - cuDNN backend determinism flags
+
+    Parameters
+    ----------
+    seed : int — the seed value (default: RANDOM_SEED = 42)
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    # Force cuDNN to use deterministic algorithms.
+    # This may reduce performance slightly but guarantees reproducibility.
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
